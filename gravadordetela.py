@@ -1,14 +1,14 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog
 import cv2
 import numpy as np
 import pyautogui
 import threading
-import sounddevice as sd
+import pyaudio
 import wave
 import os
 import time
-from moviepy.editor import VideoFileClip
+from moviepy.editor import VideoFileClip, AudioFileClip
 
 class ScreenRecorder:
     def __init__(self, root):
@@ -16,7 +16,8 @@ class ScreenRecorder:
         self.root.title("Screen Recorder")
         self.is_recording = False
         self.is_paused = False
-        self.record_audio = tk.BooleanVar()
+        self.record_mic_audio = tk.BooleanVar()
+        self.record_sys_audio = tk.BooleanVar()
         self.start_time = None
         self.pause_start_time = None
         self.total_pause_duration = 0
@@ -24,9 +25,9 @@ class ScreenRecorder:
 
         self.setup_ui()
         self.video_writer = None
-        self.audio_writer = None
         self.frames = []
         self.audio_frames = []
+        self.audio_streams = []
 
     def setup_ui(self):
         self.record_button = ttk.Button(self.root, text="Record", command=self.select_area)
@@ -41,11 +42,14 @@ class ScreenRecorder:
         self.resume_button = ttk.Button(self.root, text="Resume", command=self.resume_recording, state=tk.DISABLED)
         self.resume_button.grid(row=0, column=3, padx=10, pady=10)
         
-        self.audio_check = ttk.Checkbutton(self.root, text="Record Audio", variable=self.record_audio)
-        self.audio_check.grid(row=1, column=0, columnspan=4, pady=10)
+        self.mic_audio_check = ttk.Checkbutton(self.root, text="Record Microphone Audio", variable=self.record_mic_audio)
+        self.mic_audio_check.grid(row=1, column=0, columnspan=4, pady=10)
+
+        self.sys_audio_check = ttk.Checkbutton(self.root, text="Record System Audio", variable=self.record_sys_audio)
+        self.sys_audio_check.grid(row=2, column=0, columnspan=4, pady=10)
 
         self.time_label = ttk.Label(self.root, text="00:00:00")
-        self.time_label.grid(row=2, column=0, columnspan=4, pady=10)
+        self.time_label.grid(row=3, column=0, columnspan=4, pady=10)
 
     def select_area(self):
         self.selection_window = tk.Toplevel(self.root)
@@ -97,7 +101,7 @@ class ScreenRecorder:
         self.frames = []
         self.audio_frames = []
 
-        if self.record_audio.get():
+        if self.record_mic_audio.get() or self.record_sys_audio.get():
             self.audio_thread = threading.Thread(target=self.record_audio_data)
             self.audio_thread.start()
 
@@ -114,13 +118,56 @@ class ScreenRecorder:
             self.root.after(1000, self.update_time_label)
 
     def record_audio_data(self):
-        def callback(indata, frames, time, status):
-            self.audio_frames.append(indata.copy())
+        p = pyaudio.PyAudio()
 
-        with sd.InputStream(samplerate=44100, channels=2, callback=callback):
+        def callback(in_data, frame_count, time_info, status):
+            self.audio_frames.append(in_data)
+            return (in_data, pyaudio.paContinue)
+
+        try:
+            if self.record_mic_audio.get():
+                mic_stream = p.open(format=pyaudio.paInt16,
+                                    channels=1,  # Ajustar para 1 canal
+                                    rate=44100,
+                                    input=True,
+                                    frames_per_buffer=1024,
+                                    stream_callback=callback)
+                self.audio_streams.append(mic_stream)
+
+            if self.record_sys_audio.get():
+                sys_device_index = self.get_loopback_device_index(p)
+                if sys_device_index is not None:
+                    sys_stream = p.open(format=pyaudio.paInt16,
+                                        channels=2,  # Ajustar para 2 canais
+                                        rate=44100,
+                                        input=True,
+                                        input_device_index=sys_device_index,
+                                        frames_per_buffer=1024,
+                                        stream_callback=callback)
+                    self.audio_streams.append(sys_stream)
+
+            for stream in self.audio_streams:
+                stream.start_stream()
+
             while self.is_recording:
-                sd.sleep(1000)
-    
+                time.sleep(0.1)
+
+            for stream in self.audio_streams:
+                stream.stop_stream()
+                stream.close()
+
+        except Exception as e:
+            print(f"Erro ao gravar áudio: {e}")
+        finally:
+            p.terminate()
+
+    def get_loopback_device_index(self, p):
+        for i in range(p.get_device_count()):
+            dev_info = p.get_device_info_by_index(i)
+            if 'loopback' in dev_info['name'].lower() or 'stereo mix' in dev_info['name'].lower():
+                return i
+        return None
+
     def record_video_data(self):
         while self.is_recording:
             if not self.is_paused:
@@ -154,7 +201,7 @@ class ScreenRecorder:
         self.pause_button.config(state=tk.DISABLED)
         self.resume_button.config(state=tk.DISABLED)
 
-        if self.record_audio.get():
+        if self.record_mic_audio.get() or self.record_sys_audio.get():
             self.audio_thread.join()
             self.save_audio()
 
@@ -164,7 +211,7 @@ class ScreenRecorder:
 
     def save_audio(self):
         wf = wave.open('output_temp.wav', 'wb')
-        wf.setnchannels(2)
+        wf.setnchannels(1 if self.record_mic_audio.get() and not self.record_sys_audio.get() else 2)
         wf.setsampwidth(2)
         wf.setframerate(44100)
         wf.writeframes(b''.join(self.audio_frames))
@@ -172,19 +219,22 @@ class ScreenRecorder:
 
     def convert_to_mp4(self):
         video = VideoFileClip("output_temp.avi")
-        if self.record_audio.get():
-            audio = VideoFileClip("output_temp.wav").audio
+        if self.record_mic_audio.get() or self.record_sys_audio.get():
+            audio = AudioFileClip("output_temp.wav")
             video = video.set_audio(audio)
         video.write_videofile("output.mp4", codec="libx264")
         os.remove("output_temp.avi")
-        if self.record_audio.get():
+        if self.record_mic_audio.get() or self.record_sys_audio.get():
             os.remove("output_temp.wav")
 
     def move_to_videos(self):
+        video_name = simpledialog.askstring("Save As", "Enter the name of the video file:", parent=self.root)
+        if not video_name:
+            video_name = "output"
         videos_dir = os.path.join(os.path.expanduser("~"), "Videos")
         if not os.path.exists(videos_dir):
             os.makedirs(videos_dir)
-        os.rename("output.mp4", os.path.join(videos_dir, "output.mp4"))
+        os.rename("output.mp4", os.path.join(videos_dir, f"{video_name}.mp4"))
 
 if __name__ == "__main__":
     root = tk.Tk()
